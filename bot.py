@@ -1,7 +1,9 @@
 import os
+import re
 import logging
 import tempfile
 import asyncio
+import requests
 from pathlib import Path
 
 from telegram import Update
@@ -36,15 +38,22 @@ DEFAULT_LANG = "ko"       # 기본 언어
 
 # ── 헬퍼: 오디오 파일 → 텍스트 ──────────────────────────────
 def transcribe_file(path: str, language: str = DEFAULT_LANG) -> str:
-    """단일 파일을 Whisper API로 변환"""
+    """단일 파일을 Whisper API로 변환 (타임스탬프 포함)"""
     with open(path, "rb") as f:
         result = client.audio.transcriptions.create(
             model="whisper-1",
             file=f,
             language=language,
-            response_format="text",
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
         )
-    return result
+    lines = []
+    for seg in result.segments:
+        start = int(seg.start)
+        mm, ss = divmod(start, 60)
+        lines.append(f"[{mm:02d}:{ss:02d}] {seg.text.strip()}")
+    return "
+".join(lines)
 
 
 def split_and_transcribe(path: str, language: str = DEFAULT_LANG) -> str:
@@ -148,6 +157,80 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_audio(update, doc.file_id, lang)
 
 
+# ── 구글 드라이브 링크 처리 ──────────────────────────────────
+def extract_gdrive_id(url: str) -> str | None:
+    """구글 드라이브 URL에서 파일 ID 추출"""
+    patterns = [
+        r"/file/d/([a-zA-Z0-9_-]+)",
+        r"id=([a-zA-Z0-9_-]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def download_gdrive_file(file_id: str, dest_path: str) -> bool:
+    """구글 드라이브 파일 직접 다운로드"""
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    session = requests.Session()
+    response = session.get(url, stream=True)
+
+    # 대용량 파일 확인 토큰 처리
+    for key, value in response.cookies.items():
+        if key.startswith("download_warning"):
+            url = f"https://drive.google.com/uc?export=download&confirm={value}&id={file_id}"
+            response = session.get(url, stream=True)
+            break
+
+    if response.status_code != 200:
+        return False
+
+    with open(dest_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=32768):
+            if chunk:
+                f.write(chunk)
+    return True
+
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """텍스트 메시지에서 구글 드라이브 링크 감지 후 처리"""
+    text = update.message.text or ""
+    if "drive.google.com" not in text:
+        await update.message.reply_text("⚠️ 구글 드라이브 링크만 지원됩니다.")
+        return
+
+    file_id = extract_gdrive_id(text)
+    if not file_id:
+        await update.message.reply_text("⚠️ 링크에서 파일 ID를 찾을 수 없습니다.")
+        return
+
+    lang = context.user_data.get("lang", DEFAULT_LANG)
+    msg = update.effective_message
+    status = await msg.reply_text("🔗 구글 드라이브에서 다운로드 중…")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_path = os.path.join(tmpdir, "audio.m4a")
+        success = download_gdrive_file(file_id, local_path)
+
+        if not success:
+            await status.edit_text("❌ 다운로드 실패. 파일 공유 설정을 '링크가 있는 모든 사용자'로 변경해 주세요.")
+            return
+
+        size_mb = os.path.getsize(local_path) / (1024 * 1024)
+        await status.edit_text(f"⚙️ 다운로드 완료 ({size_mb:.1f}MB), 변환 중…")
+
+        if size_mb > MAX_FILE_MB:
+            text_result = split_and_transcribe(local_path, lang)
+        else:
+            text_result = transcribe_file(local_path, lang)
+
+    await status.delete()
+    for i in range(0, len(text_result), 4000):
+        await msg.reply_text(text_result[i : i + 4000])
+
+
 # ── 메인 ────────────────────────────────────────────────────
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -157,6 +240,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
     logger.info("STT 봇 시작")
     app.run_polling(drop_pending_updates=True)
