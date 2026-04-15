@@ -43,7 +43,7 @@ MERGE_SECONDS = 30
 # ── STT + 화자 구분 ──────────────────────────────────────────
 def transcribe_with_diarization(path: str, language: str = DEFAULT_LANG) -> str:
     config = aai.TranscriptionConfig(
-        speech_models=["universal-3-pro"],
+        speech_models=["universal-3-pro", "universal-2"],
         speaker_labels=True,
         language_detection=True,
     )
