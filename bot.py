@@ -39,12 +39,11 @@ SPEAKER_LABELS = {
     "C": "화자 3",
     "D": "화자 4",
 }
-MERGE_SECONDS = 30  # 같은 화자 발화를 묶는 단위
+MERGE_SECONDS = 30
 
 
 # ── AssemblyAI 파이프라인 ────────────────────────────────────
 def upload_file(path: str) -> str:
-    """파일을 AssemblyAI에 업로드하고 upload_url 반환"""
     with open(path, "rb") as f:
         response = requests.post(ASSEMBLYAI_UPLOAD_URL, headers=HEADERS, data=f)
     response.raise_for_status()
@@ -52,8 +51,7 @@ def upload_file(path: str) -> str:
 
 
 def request_transcript(upload_url: str, language: str = DEFAULT_LANG) -> str:
-    """변환 요청 후 transcript_id 반환"""
-payload = {
+    payload = {
         "audio_url": upload_url,
         "speaker_labels": True,
         "language_detection": True,
@@ -64,7 +62,6 @@ payload = {
 
 
 def poll_transcript(transcript_id: str) -> dict:
-    """변환 완료까지 폴링"""
     url = f"{ASSEMBLYAI_TRANSCRIPT_URL}/{transcript_id}"
     while True:
         response = requests.get(url, headers=HEADERS)
@@ -80,7 +77,6 @@ def poll_transcript(transcript_id: str) -> dict:
 
 
 def format_transcript(data: dict) -> str:
-    """화자 구분 + 타임스탬프 형식으로 포맷"""
     utterances = data.get("utterances", [])
     if not utterances:
         return data.get("text", "")
@@ -96,7 +92,6 @@ def format_transcript(data: dict) -> str:
         start_sec = start_ms // 1000
         text = utt["text"].strip()
 
-        # 화자가 바뀌거나 30초 이상 지나면 새 블록
         if (speaker != current_speaker or
                 (current_start is not None and start_sec - current_start >= MERGE_SECONDS)):
             if current_texts:
@@ -108,7 +103,6 @@ def format_transcript(data: dict) -> str:
 
         current_texts.append(" " + text)
 
-    # 마지막 블록
     if current_texts:
         mm, ss = divmod(current_start, 60)
         lines.append(f"{current_speaker} {mm:02d}:{ss:02d}\n{''.join(current_texts).strip()}")
@@ -117,7 +111,6 @@ def format_transcript(data: dict) -> str:
 
 
 def transcribe_with_diarization(path: str, language: str = DEFAULT_LANG) -> str:
-    """전체 파이프라인: 업로드 → 변환 요청 → 폴링 → 포맷"""
     logger.info("AssemblyAI 업로드 중...")
     upload_url = upload_file(path)
     logger.info("변환 요청 중...")
