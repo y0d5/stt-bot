@@ -1,9 +1,9 @@
 import os
 import re
-import time
 import logging
 import tempfile
 import requests
+import assemblyai as aai
 from pathlib import Path
 
 from telegram import Update
@@ -26,10 +26,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ASSEMBLYAI_API_KEY = os.environ["ASSEMBLYAI_API_KEY"]
 
-ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
-ASSEMBLYAI_TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
-
-HEADERS = {"authorization": ASSEMBLYAI_API_KEY}
+aai.settings.api_key = ASSEMBLYAI_API_KEY
 
 # ── 상수 ────────────────────────────────────────────────────
 DEFAULT_LANG = "ko"
@@ -38,59 +35,32 @@ SPEAKER_LABELS = {
     "B": "화자 2",
     "C": "화자 3",
     "D": "화자 4",
+    "E": "화자 5",
 }
 MERGE_SECONDS = 30
 
 
-# ── AssemblyAI 파이프라인 ────────────────────────────────────
-def upload_file(path: str) -> str:
-    with open(path, "rb") as f:
-        response = requests.post(ASSEMBLYAI_UPLOAD_URL, headers=HEADERS, data=f)
-    response.raise_for_status()
-    return response.json()["upload_url"]
+# ── STT + 화자 구분 ──────────────────────────────────────────
+def transcribe_with_diarization(path: str, language: str = DEFAULT_LANG) -> str:
+    config = aai.TranscriptionConfig(speaker_labels=True)
+    transcriber = aai.Transcriber()
+    logger.info("AssemblyAI 변환 시작...")
+    transcript = transcriber.transcribe(path, config=config)
 
+    if transcript.status == aai.TranscriptStatus.error:
+        raise RuntimeError(f"AssemblyAI 오류: {transcript.error}")
 
-def request_transcript(upload_url: str, language: str = DEFAULT_LANG) -> str:
-    payload = {
-        "audio_url": upload_url,
-        "speaker_labels": True,
-        "speech_model": "universal-2",
-    }
-    response = requests.post(ASSEMBLYAI_TRANSCRIPT_URL, json=payload, headers=HEADERS)
-    response.raise_for_status()
-    return response.json()["id"]
-
-
-def poll_transcript(transcript_id: str) -> dict:
-    url = f"{ASSEMBLYAI_TRANSCRIPT_URL}/{transcript_id}"
-    while True:
-        response = requests.get(url, headers=HEADERS)
-        response.raise_for_status()
-        data = response.json()
-        status = data["status"]
-        if status == "completed":
-            return data
-        elif status == "error":
-            raise RuntimeError(f"AssemblyAI 오류: {data.get('error')}")
-        logger.info(f"변환 중... ({status})")
-        time.sleep(3)
-
-
-def format_transcript(data: dict) -> str:
-    utterances = data.get("utterances", [])
-    if not utterances:
-        return data.get("text", "")
+    if not transcript.utterances:
+        return transcript.text or ""
 
     lines = []
     current_speaker = None
     current_texts = []
     current_start = None
 
-    for utt in utterances:
-        speaker = SPEAKER_LABELS.get(utt["speaker"], f"화자 {utt['speaker']}")
-        start_ms = utt["start"]
-        start_sec = start_ms // 1000
-        text = utt["text"].strip()
+    for utt in transcript.utterances:
+        speaker = SPEAKER_LABELS.get(utt.speaker, f"화자 {utt.speaker}")
+        start_sec = utt.start // 1000
 
         if (speaker != current_speaker or
                 (current_start is not None and start_sec - current_start >= MERGE_SECONDS)):
@@ -101,23 +71,13 @@ def format_transcript(data: dict) -> str:
             current_texts = []
             current_start = start_sec
 
-        current_texts.append(" " + text)
+        current_texts.append(" " + utt.text)
 
     if current_texts:
         mm, ss = divmod(current_start, 60)
         lines.append(f"{current_speaker} {mm:02d}:{ss:02d}\n{''.join(current_texts).strip()}")
 
     return "\n\n".join(lines)
-
-
-def transcribe_with_diarization(path: str, language: str = DEFAULT_LANG) -> str:
-    logger.info("AssemblyAI 업로드 중...")
-    upload_url = upload_file(path)
-    logger.info("변환 요청 중...")
-    transcript_id = request_transcript(upload_url, language)
-    logger.info(f"transcript_id: {transcript_id}")
-    data = poll_transcript(transcript_id)
-    return format_transcript(data)
 
 
 # ── 오디오 처리 파이프라인 ────────────────────────────────────
@@ -149,7 +109,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "음성 메시지 또는 오디오 파일을 전송하면\n"
         "화자별로 구분하여 텍스트로 변환해 드립니다.\n\n"
         "📌 *지원 포맷:* m4a · mp3 · wav · ogg · flac\n"
-        "📌 *파일 크기:* 20MB 이하\n\n"
+        "📌 *파일 크기:* 20MB 이하 (직접 전송)\n"
+        "📌 *대용량:* 구글 드라이브 링크 전송\n\n"
         "━━━━━━━━━━━━━━━\n"
         "/lang ko — 한국어 (기본)\n"
         "/lang en — 영어\n"
