@@ -48,10 +48,25 @@ def transcribe_file(path: str, language: str = DEFAULT_LANG) -> str:
             timestamp_granularities=["segment"],
         )
     lines = []
+    current_texts = []
+    current_start = None
+    MERGE_SECONDS = 30  # 30초 단위로 묶기
+
     for seg in result.segments:
         start = int(seg.start)
-        mm, ss = divmod(start, 60)
-        lines.append(f"[{mm:02d}:{ss:02d}] {seg.text.strip()}")
+        if current_start is None:
+            current_start = start
+        if start - current_start >= MERGE_SECONDS:
+            mm, ss = divmod(current_start, 60)
+            lines.append(f"[{mm:02d}:{ss:02d}] {''.join(current_texts).strip()}")
+            current_texts = []
+            current_start = start
+        current_texts.append(seg.text)
+
+    if current_texts:
+        mm, ss = divmod(current_start, 60)
+        lines.append(f"[{mm:02d}:{ss:02d}] {''.join(current_texts).strip()}")
+
     return "\n".join(lines)
 
 
