@@ -52,8 +52,7 @@ def transcribe_file(path: str, language: str = DEFAULT_LANG) -> str:
         start = int(seg.start)
         mm, ss = divmod(start, 60)
         lines.append(f"[{mm:02d}:{ss:02d}] {seg.text.strip()}")
-    return "
-".join(lines)
+    return "\n".join(lines)
 
 
 def split_and_transcribe(path: str, language: str = DEFAULT_LANG) -> str:
