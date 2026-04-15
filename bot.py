@@ -53,10 +53,10 @@ def upload_file(path: str) -> str:
 
 def request_transcript(upload_url: str, language: str = DEFAULT_LANG) -> str:
     """변환 요청 후 transcript_id 반환"""
-    payload = {
+payload = {
         "audio_url": upload_url,
         "speaker_labels": True,
-        "language_code": language,
+        "language_detection": True,
     }
     response = requests.post(ASSEMBLYAI_TRANSCRIPT_URL, json=payload, headers=HEADERS)
     response.raise_for_status()
