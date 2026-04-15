@@ -1,8 +1,8 @@
 import os
 import re
+import time
 import logging
 import tempfile
-import asyncio
 import requests
 from pathlib import Path
 
@@ -14,8 +14,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from openai import OpenAI
-from pydub import AudioSegment
 
 # ── 로깅 설정 ──────────────────────────────────────────────
 logging.basicConfig(
@@ -26,92 +24,127 @@ logger = logging.getLogger(__name__)
 
 # ── 환경변수 ────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+ASSEMBLYAI_API_KEY = os.environ["ASSEMBLYAI_API_KEY"]
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
+ASSEMBLYAI_TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
+
+HEADERS = {"authorization": ASSEMBLYAI_API_KEY}
 
 # ── 상수 ────────────────────────────────────────────────────
-MAX_FILE_MB = 24          # Whisper API 25MB 제한보다 약간 낮게
-CHUNK_MINUTES = 10        # 긴 파일 분할 단위
-DEFAULT_LANG = "ko"       # 기본 언어
+DEFAULT_LANG = "ko"
+SPEAKER_LABELS = {
+    "A": "화자 1",
+    "B": "화자 2",
+    "C": "화자 3",
+    "D": "화자 4",
+}
+MERGE_SECONDS = 30  # 같은 화자 발화를 묶는 단위
 
 
-# ── 헬퍼: 오디오 파일 → 텍스트 ──────────────────────────────
-def transcribe_file(path: str, language: str = DEFAULT_LANG) -> str:
-    """단일 파일을 Whisper API로 변환 (타임스탬프 포함)"""
+# ── AssemblyAI 파이프라인 ────────────────────────────────────
+def upload_file(path: str) -> str:
+    """파일을 AssemblyAI에 업로드하고 upload_url 반환"""
     with open(path, "rb") as f:
-        result = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-            language=language,
-            response_format="verbose_json",
-            timestamp_granularities=["segment"],
-        )
+        response = requests.post(ASSEMBLYAI_UPLOAD_URL, headers=HEADERS, data=f)
+    response.raise_for_status()
+    return response.json()["upload_url"]
+
+
+def request_transcript(upload_url: str, language: str = DEFAULT_LANG) -> str:
+    """변환 요청 후 transcript_id 반환"""
+    payload = {
+        "audio_url": upload_url,
+        "speaker_labels": True,
+        "language_code": language,
+    }
+    response = requests.post(ASSEMBLYAI_TRANSCRIPT_URL, json=payload, headers=HEADERS)
+    response.raise_for_status()
+    return response.json()["id"]
+
+
+def poll_transcript(transcript_id: str) -> dict:
+    """변환 완료까지 폴링"""
+    url = f"{ASSEMBLYAI_TRANSCRIPT_URL}/{transcript_id}"
+    while True:
+        response = requests.get(url, headers=HEADERS)
+        response.raise_for_status()
+        data = response.json()
+        status = data["status"]
+        if status == "completed":
+            return data
+        elif status == "error":
+            raise RuntimeError(f"AssemblyAI 오류: {data.get('error')}")
+        logger.info(f"변환 중... ({status})")
+        time.sleep(3)
+
+
+def format_transcript(data: dict) -> str:
+    """화자 구분 + 타임스탬프 형식으로 포맷"""
+    utterances = data.get("utterances", [])
+    if not utterances:
+        return data.get("text", "")
+
     lines = []
+    current_speaker = None
     current_texts = []
     current_start = None
-    MERGE_SECONDS = 30  # 30초 단위로 묶기
 
-    for seg in result.segments:
-        start = int(seg.start)
-        if current_start is None:
-            current_start = start
-        if start - current_start >= MERGE_SECONDS:
-            mm, ss = divmod(current_start, 60)
-            lines.append(f"[{mm:02d}:{ss:02d}] {''.join(current_texts).strip()}")
+    for utt in utterances:
+        speaker = SPEAKER_LABELS.get(utt["speaker"], f"화자 {utt['speaker']}")
+        start_ms = utt["start"]
+        start_sec = start_ms // 1000
+        text = utt["text"].strip()
+
+        # 화자가 바뀌거나 30초 이상 지나면 새 블록
+        if (speaker != current_speaker or
+                (current_start is not None and start_sec - current_start >= MERGE_SECONDS)):
+            if current_texts:
+                mm, ss = divmod(current_start, 60)
+                lines.append(f"{current_speaker} {mm:02d}:{ss:02d}\n{''.join(current_texts).strip()}")
+            current_speaker = speaker
             current_texts = []
-            current_start = start
-        current_texts.append(seg.text)
+            current_start = start_sec
 
+        current_texts.append(" " + text)
+
+    # 마지막 블록
     if current_texts:
         mm, ss = divmod(current_start, 60)
-        lines.append(f"[{mm:02d}:{ss:02d}] {''.join(current_texts).strip()}")
+        lines.append(f"{current_speaker} {mm:02d}:{ss:02d}\n{''.join(current_texts).strip()}")
 
-    return "\n".join(lines)
-
-
-def split_and_transcribe(path: str, language: str = DEFAULT_LANG) -> str:
-    """25MB 초과 파일은 10분 단위로 분할 후 순차 변환"""
-    audio = AudioSegment.from_file(path)
-    chunk_ms = CHUNK_MINUTES * 60 * 1000
-    texts = []
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for idx, start in enumerate(range(0, len(audio), chunk_ms)):
-            chunk = audio[start : start + chunk_ms]
-            chunk_path = os.path.join(tmpdir, f"chunk_{idx:03d}.ogg")
-            chunk.export(chunk_path, format="ogg")
-            logger.info(f"청크 {idx+1} 변환 중…")
-            texts.append(transcribe_file(chunk_path, language))
-
-    return "\n".join(texts)
+    return "\n\n".join(lines)
 
 
+def transcribe_with_diarization(path: str, language: str = DEFAULT_LANG) -> str:
+    """전체 파이프라인: 업로드 → 변환 요청 → 폴링 → 포맷"""
+    logger.info("AssemblyAI 업로드 중...")
+    upload_url = upload_file(path)
+    logger.info("변환 요청 중...")
+    transcript_id = request_transcript(upload_url, language)
+    logger.info(f"transcript_id: {transcript_id}")
+    data = poll_transcript(transcript_id)
+    return format_transcript(data)
+
+
+# ── 오디오 처리 파이프라인 ────────────────────────────────────
 async def process_audio(update: Update, file_id: str, language: str = DEFAULT_LANG):
-    """공통 오디오 처리 파이프라인"""
     msg = update.effective_message
     status = await msg.reply_text("🎙️ 파일 수신 중…")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # 파일 다운로드
         tg_file = await update.get_bot().get_file(file_id)
-        suffix = Path(tg_file.file_path).suffix or ".ogg"
+        suffix = Path(tg_file.file_path).suffix or ".m4a"
         local_path = os.path.join(tmpdir, f"audio{suffix}")
         await tg_file.download_to_drive(local_path)
 
         size_mb = os.path.getsize(local_path) / (1024 * 1024)
         logger.info(f"다운로드 완료: {size_mb:.1f} MB")
+        await status.edit_text("⚙️ 화자 분리 및 변환 중… (1~2분 소요)")
 
-        await status.edit_text("⚙️ 변환 중… (파일 크기에 따라 수십 초 소요)")
-
-        if size_mb > MAX_FILE_MB:
-            text = split_and_transcribe(local_path, language)
-        else:
-            text = transcribe_file(local_path, language)
+        text = transcribe_with_diarization(local_path, language)
 
     await status.delete()
-
-    # 4096자 초과 시 분할 전송
     for i in range(0, len(text), 4000):
         await msg.reply_text(text[i : i + 4000])
 
@@ -119,66 +152,57 @@ async def process_audio(update: Update, file_id: str, language: str = DEFAULT_LA
 # ── 커맨드 핸들러 ────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎙️ *STT 봇에 오신 걸 환영합니다!*\n\n"
-        "음성 메시지 또는 오디오 파일을 전송하면 텍스트로 변환해 드립니다.\n\n"
-        "📌 *지원 포맷:* m4a · mp3 · wav · ogg · flac · webm\n"
-        "📌 *기본 언어:* 한국어 (자동 감지도 됩니다)\n\n"
+        "🎙️ *STT 봇 (화자 구분 지원)*\n\n"
+        "음성 메시지 또는 오디오 파일을 전송하면\n"
+        "화자별로 구분하여 텍스트로 변환해 드립니다.\n\n"
+        "📌 *지원 포맷:* m4a · mp3 · wav · ogg · flac\n"
+        "📌 *파일 크기:* 20MB 이하\n\n"
         "━━━━━━━━━━━━━━━\n"
-        "/lang en — 영어 모드\n"
-        "/lang ko — 한국어 모드 (기본)\n"
-        "/lang ja — 일본어 모드\n"
-        "/lang auto — 자동 감지\n",
+        "/lang ko — 한국어 (기본)\n"
+        "/lang en — 영어\n"
+        "/lang ja — 일본어\n",
         parse_mode="Markdown",
     )
 
 
 async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("사용법: /lang ko | en | ja | auto")
+        await update.message.reply_text("사용법: /lang ko | en | ja")
         return
     lang = context.args[0].lower()
-    valid = {"ko", "en", "ja", "zh", "auto"}
+    valid = {"ko": "한국어", "en": "영어", "ja": "일본어"}
     if lang not in valid:
-        await update.message.reply_text(f"지원 언어: {', '.join(valid)}")
+        await update.message.reply_text(f"지원 언어: {', '.join(valid.keys())}")
         return
-    context.user_data["lang"] = lang if lang != "auto" else None
-    label = {"ko": "한국어", "en": "영어", "ja": "일본어", "zh": "중국어", "auto": "자동 감지"}.get(lang, lang)
-    await update.message.reply_text(f"✅ 언어 설정: {label}")
+    context.user_data["lang"] = lang
+    await update.message.reply_text(f"✅ 언어 설정: {valid[lang]}")
 
 
 # ── 메시지 핸들러 ────────────────────────────────────────────
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """텔레그램 내 마이크 녹음 (voice)"""
     lang = context.user_data.get("lang", DEFAULT_LANG)
     await process_audio(update, update.message.voice.file_id, lang)
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """첨부 오디오 파일 (audio)"""
     lang = context.user_data.get("lang", DEFAULT_LANG)
     await process_audio(update, update.message.audio.file_id, lang)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """document 타입으로 전송된 오디오 파일"""
     doc = update.message.document
     audio_exts = {".mp3", ".m4a", ".wav", ".ogg", ".flac", ".webm", ".mp4"}
     suffix = Path(doc.file_name or "").suffix.lower()
     if suffix not in audio_exts:
-        await update.message.reply_text("⚠️ 지원하지 않는 파일 형식입니다.\n지원 포맷: mp3 · m4a · wav · ogg · flac · webm")
+        await update.message.reply_text("⚠️ 지원하지 않는 파일 형식입니다.")
         return
     lang = context.user_data.get("lang", DEFAULT_LANG)
     await process_audio(update, doc.file_id, lang)
 
 
 # ── 구글 드라이브 링크 처리 ──────────────────────────────────
-def extract_gdrive_id(url: str) -> str | None:
-    """구글 드라이브 URL에서 파일 ID 추출"""
-    patterns = [
-        r"/file/d/([a-zA-Z0-9_-]+)",
-        r"id=([a-zA-Z0-9_-]+)",
-    ]
-    for pattern in patterns:
+def extract_gdrive_id(url: str):
+    for pattern in [r"/file/d/([a-zA-Z0-9_-]+)", r"id=([a-zA-Z0-9_-]+)"]:
         match = re.search(pattern, url)
         if match:
             return match.group(1)
@@ -186,21 +210,16 @@ def extract_gdrive_id(url: str) -> str | None:
 
 
 def download_gdrive_file(file_id: str, dest_path: str) -> bool:
-    """구글 드라이브 파일 직접 다운로드"""
     url = f"https://drive.google.com/uc?export=download&id={file_id}"
     session = requests.Session()
     response = session.get(url, stream=True)
-
-    # 대용량 파일 확인 토큰 처리
     for key, value in response.cookies.items():
         if key.startswith("download_warning"):
             url = f"https://drive.google.com/uc?export=download&confirm={value}&id={file_id}"
             response = session.get(url, stream=True)
             break
-
     if response.status_code != 200:
         return False
-
     with open(dest_path, "wb") as f:
         for chunk in response.iter_content(chunk_size=32768):
             if chunk:
@@ -209,37 +228,26 @@ def download_gdrive_file(file_id: str, dest_path: str) -> bool:
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """텍스트 메시지에서 구글 드라이브 링크 감지 후 처리"""
     text = update.message.text or ""
     if "drive.google.com" not in text:
         await update.message.reply_text("⚠️ 구글 드라이브 링크만 지원됩니다.")
         return
-
     file_id = extract_gdrive_id(text)
     if not file_id:
         await update.message.reply_text("⚠️ 링크에서 파일 ID를 찾을 수 없습니다.")
         return
-
     lang = context.user_data.get("lang", DEFAULT_LANG)
     msg = update.effective_message
     status = await msg.reply_text("🔗 구글 드라이브에서 다운로드 중…")
-
     with tempfile.TemporaryDirectory() as tmpdir:
         local_path = os.path.join(tmpdir, "audio.m4a")
         success = download_gdrive_file(file_id, local_path)
-
         if not success:
-            await status.edit_text("❌ 다운로드 실패. 파일 공유 설정을 '링크가 있는 모든 사용자'로 변경해 주세요.")
+            await status.edit_text("❌ 다운로드 실패. 공유 설정을 '링크가 있는 모든 사용자'로 변경해 주세요.")
             return
-
         size_mb = os.path.getsize(local_path) / (1024 * 1024)
-        await status.edit_text(f"⚙️ 다운로드 완료 ({size_mb:.1f}MB), 변환 중…")
-
-        if size_mb > MAX_FILE_MB:
-            text_result = split_and_transcribe(local_path, lang)
-        else:
-            text_result = transcribe_file(local_path, lang)
-
+        await status.edit_text(f"⚙️ 다운로드 완료 ({size_mb:.1f}MB), 화자 분리 및 변환 중…")
+        text_result = transcribe_with_diarization(local_path, lang)
     await status.delete()
     for i in range(0, len(text_result), 4000):
         await msg.reply_text(text_result[i : i + 4000])
@@ -248,15 +256,13 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── 메인 ────────────────────────────────────────────────────
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-
-    logger.info("STT 봇 시작")
+    logger.info("STT 봇 시작 (화자 구분 모드)")
     app.run_polling(drop_pending_updates=True)
 
 
