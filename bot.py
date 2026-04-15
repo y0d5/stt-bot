@@ -42,11 +42,11 @@ MERGE_SECONDS = 30
 
 # ── STT + 화자 구분 ──────────────────────────────────────────
 def transcribe_with_diarization(path: str, language: str = DEFAULT_LANG) -> str:
-config = aai.TranscriptionConfig(
-    speech_models=["universal-3-pro"],
-    speaker_labels=True,
-    language_detection=True,
-)
+    config = aai.TranscriptionConfig(
+        speech_models=["universal-3-pro"],
+        speaker_labels=True,
+        language_detection=True,
+    )
     transcriber = aai.Transcriber()
     logger.info("AssemblyAI 변환 시작...")
     transcript = transcriber.transcribe(path, config=config)
